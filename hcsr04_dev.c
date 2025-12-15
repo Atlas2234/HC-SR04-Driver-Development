@@ -27,12 +27,22 @@ static volatile char gpio_in_value;
 static struct gpio_desc *gpiod_out;
 static struct gpio_desc *gpiod_in;
 
+// For automatically adding device node
+static struct class *gpio_class;
+static struct device *gpio_device;
+
 static irqreturn_t InterruptHandler(int irq, void *dev_id) {
 	gpio_in_value = gpiod_get_value_cansleep(gpiod_in);
 
 	pr_info("gpio_dev: %s got GPIO_IN with value %c\n", __func__, gpio_in_value + '0');
 
 	return IRQ_HANDLED;
+}
+
+static char *gpio_devnode(const struct device *dev, umode_t *mode) {
+	if (mode)
+		*mode = 0666; //rw for everyone
+	return NULL;
 }
 
 static int gpio_open(struct inode *inode, struct file *file) {
@@ -113,6 +123,30 @@ static int __init gpio_module_init(void) {
 	if (ret)
 		goto err_chrdev;
 
+	gpio_class = class_create("hcsr04");
+	if (IS_ERR(gpio_class)) {
+		pr_err("gpio_dev: failed to create class\n");
+		ret = PTR_ERR(gpio_class);
+
+		goto err_cdev;
+	}
+
+	gpio_class->devnode = gpio_devnode;
+
+	gpio_device = device_create(
+		gpio_class,
+		NULL,
+		gpio_dev,
+		NULL,
+		"hcsr04_dev"	
+	);
+	
+	if (IS_ERR(gpio_device)) {
+		pr_err("gpio_dev: failed to create device \n");
+		ret = PTR_ERR(gpio_device);
+		goto err_class;
+	}
+
 	gpiod_out = gpio_to_desc(GPIO_OUT + GPIO_OFFSET);
 	if(!gpiod_out) {
 		pr_err("gpio_dev: %s unable to get desc for GPIO_OUT=%d\n", __func__, GPIO_OUT);
@@ -158,7 +192,10 @@ err_cdev:
 	cdev_del(&gpio_cdev);
 err_chrdev:
 	unregister_chrdev_region(gpio_dev, 1);
-	return ret;
+err_class:
+	class_destroy(gpio_class);
+
+return ret;
 }
 
 static void __exit gpio_module_cleanup(void) {
@@ -171,6 +208,10 @@ static void __exit gpio_module_cleanup(void) {
 		free_irq(irq, NULL);
 
 	gpio_lock = 0;
+	
+	device_destroy(gpio_class, gpio_dev);
+	class_destroy(gpio_class);
+
 	cdev_del(&gpio_cdev);
 	unregister_chrdev_region(gpio_dev, 1);
 }
