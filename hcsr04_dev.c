@@ -13,6 +13,11 @@
 
 #include <linux/interrupt.h>
 
+#include <linux/ktime.h>
+#include <linux/wait.h>
+#include <linux/delay.h>
+
+
 #define GPIO_OUT 20
 #define GPIO_IN 21
 
@@ -31,12 +36,35 @@ static struct gpio_desc *gpiod_in;
 static struct class *gpio_class;
 static struct device *gpio_device;
 
+static ktime_t echo_start;
+static ktime_t echo_end;
+
+static wait_queue_head_t echo_wq;
+static bool measurement_done;
+
 static irqreturn_t InterruptHandler(int irq, void *dev_id) {
-	gpio_in_value = gpiod_get_value_cansleep(gpiod_in);
+	int value = gpiod_get_value(gpiod_in);
+
+	if(value) {
+		// Rising edge
+		echo_start = ktime_get();
+	} else {
+		// Faling edge
+		echo_end = ktime_get();
+		measurement_done = true;
+		wake_up_interruptible(&echo_wq);
+	}
+
 
 	pr_info("gpio_dev: %s got GPIO_IN with value %c\n", __func__, gpio_in_value + '0');
 
 	return IRQ_HANDLED;
+}
+
+static void hcsr04_trigger(void) {
+	gpiod_set_value(gpiod_in, 1);
+	udelay(10);
+	gpiod_set_value(gpiod_in, 0);
 }
 
 static char *gpio_devnode(const struct device *dev, umode_t *mode) {
@@ -60,17 +88,32 @@ static int gpio_close(struct inode *inode, struct file *file) {
 }
 
 static ssize_t gpio_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos) {
-	char kbuf[2];
+	s64 duration_ns;
+	u32 distance_cm;
 
-	pr_info("gpio read (count=%d, offset=%d)\n", (int)count, (int)*f_pos);
+	if (count < sizeof(distance_cm))
+		return -EINVAL;
 
-	kbuf[0] = gpio_in_value;
-	kbuf[1] = 0;
+	measurement_done = false;
 
-	if (copy_to_user(buf, kbuf, 1))
+	hcsr04_trigger();
+
+	// Wait for echo pulse to complete (timeout!)
+	if (wait_event_interruptible_timeout(echo_wq, measurement_done, msecs_to_jiffies(60)) == 0) {
+		return -ETIMEDOUT;
+	}
+
+	duration_ns = ktime_to_ns(ktime_sub(echo_end, echo_start));
+
+	// Convert ns -> us -> cm
+	distance_cm = (u32)(duration_ns / 1000 / 58);
+	
+	if (copy_to_user(buf, &distance_cm, sizeof(distance_cm)))
 		return -EFAULT;
+	
+	pr_info("gpio read (count=%d, offset=%d)\n", (int)count, (int)*f_pos);
+	return sizeof(distance_cm);
 
-	return 1;
 }
 
 static ssize_t gpio_write(struct file *filp, const char __user *ubuf, size_t length, loff_t *offset) {
@@ -185,6 +228,12 @@ static int __init gpio_module_init(void) {
 		pr_err("gpio_dev: %s unable to register IRQ for GPIO_IN\n", __func__);
 		goto err_cdev;
 	}
+
+	init_waitqueue_head(&echo_wq);
+	measurement_done = false;
+
+	pr_info("hcsr04: driver loaded successfully\n");
+	pr_info("hcsr04: echo IRQ = %d\n", echo_irq);
 
 	return 0;
 
