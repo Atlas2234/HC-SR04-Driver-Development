@@ -1,8 +1,8 @@
-# read distance
+# read_distance.py
 import struct
 import time
 
-DEV_PATH = "/dev/hcsr04_dev"
+DEV = "/dev/hcsr04_dev"
 
 def read_distance_cm() -> int:
     with open(DEV, "rb", buffering=0) as f:
