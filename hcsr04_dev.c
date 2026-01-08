@@ -1,245 +1,233 @@
-// hcsr04_dev.c
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 
+#include <linux/types.h>
+#include <linux/kdev_t.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
-#include <linux/device.h>
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
 
 #include <linux/gpio.h>
-#include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
 
+#include <linux/time.h>
 #include <linux/ktime.h>
-#include <linux/wait.h>
+#include <asm/delay.h>
 #include <linux/delay.h>
-#include <linux/version.h>
 
-#define DEVICE_NAME "hcsr04_dev"
-#define CLASS_NAME  "hcsr04"
+#define GPIO_OUT        20                      // GPIO20 trigger pin
+#define GPIO_IN         21                      // GPIO21 echo pin
 
-/*
- * Raspberry Pi GPIO numbers
- * (BCM numbering + offset depends on your kernel;
- * this matches what you were already using)
- */
-#define GPIO_TRIG   21
-#define GPIO_ECHO   20
-#define GPIO_OFFSET 512
+static dev_t hcsr04_dev;
 
-static dev_t devt;
-static struct cdev hcsr04_cdev;
-static struct class *hcsr04_class;
-static struct device *hcsr04_device;
+struct cdev hcsr04_cdev;
 
-/* GPIO descriptors */
-static struct gpio_desc *gpiod_trig;
-static struct gpio_desc *gpiod_echo;
+// Lock variable to prevent multiple access to device
+static int hcsr04_lock = 0;
 
-/* IRQ */
-static int echo_irq;
+static struct kobject *hcsr04_kobject;
 
-/* Timing + synchronization */
-static ktime_t echo_start;
-static ktime_t echo_end;
-static wait_queue_head_t echo_wq;
-static bool measurement_done;
+static ktime_t rising, falling;
 
-/* -------------------------------------------------- */
-/* Interrupt handler                                  */
-/* -------------------------------------------------- */
-static irqreturn_t hcsr04_irq_handler(int irq, void *dev_id)
+// File operation callback functions for our character device
+int hcsr04_open(struct inode *inode, struct file *file)
 {
-    int value = gpiod_get_value(gpiod_echo);
+    int ret = 0;
+    printk( KERN_INFO "hcsr04_dev: %s\n", __func__ );
 
-    if (value) {
-        /* Rising edge */
-        echo_start = ktime_get();
-    } else {
-        /* Falling edge */
-        echo_end = ktime_get();
-        measurement_done = true;
-        wake_up_interruptible(&echo_wq);
+    // Check if device is locked
+    if( hcsr04_lock > 0 )
+    {
+        ret = -EBUSY;
     }
+    // Lock device if not locked
+    else
+        hcsr04_lock++;
 
-    return IRQ_HANDLED;
+   return( ret );
 }
 
-/* -------------------------------------------------- */
-/* Trigger pulse                                      */
-/* -------------------------------------------------- */
-static void hcsr04_trigger(void)
+int hcsr04_close(struct inode *inode, struct file *file)
 {
-    gpiod_set_value(gpiod_trig, 1);
-    udelay(10);                /* 10 µs pulse */
-    gpiod_set_value(gpiod_trig, 0);
+    printk( KERN_INFO "hcsr04_dev: %s\n", __func__ );
+
+    // Unlock device when closed
+    hcsr04_lock = 0;
+
+    return( 0 );
 }
 
-/* -------------------------------------------------- */
-/* Character device read()                            */
-/* -------------------------------------------------- */
-static ssize_t hcsr04_read(
-    struct file *file,
-    char __user *buf,
-    size_t count,
-    loff_t *ppos
-)
-{
-    s64 duration_ns;
-    u32 distance_cm;
-
-    if (count < sizeof(distance_cm))
-        return -EINVAL;
-
-    measurement_done = false;
-
-    /* Start measurement */
-    hcsr04_trigger();
-
-    /* Wait for echo (timeout ~60 ms) */
-    if (wait_event_interruptible_timeout(
-            echo_wq,
-            measurement_done,
-            msecs_to_jiffies(60)) == 0) {
-        return -ETIMEDOUT;
-    }
-
-    duration_ns = ktime_to_ns(ktime_sub(echo_end, echo_start));
-
-    /*
-     * HC-SR04 formula:
-     * distance_cm = echo_time_us / 58
-     */
-    distance_cm = (u32)((duration_ns / 1000) / 58);
-
-    if (copy_to_user(buf, &distance_cm, sizeof(distance_cm)))
-        return -EFAULT;
-
-    return sizeof(distance_cm);
-}
-
-/* -------------------------------------------------- */
-/* File operations                                    */
-/* -------------------------------------------------- */
-static const struct file_operations hcsr04_fops = {
-    .owner = THIS_MODULE,
-    .read  = hcsr04_read,
-};
-
-/* -------------------------------------------------- */
-/* Module init                                        */
-/* -------------------------------------------------- */
-static int __init hcsr04_init(void)
+ssize_t hcsr04_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
 {
     int ret;
+    int pulse;
 
-    pr_info("hcsr04: loading driver\n");
+    printk( KERN_INFO "hcsr04_dev: %s\n", __func__ );
 
-    /* Allocate device numbers */
-    ret = alloc_chrdev_region(&devt, 0, 1, DEVICE_NAME);
-    if (ret)
-        return ret;
+    // Calculate pulse width in microseconds
+    pulse = (int)ktime_to_us( ktime_sub( falling, rising ) );
 
-    /* Register cdev */
+    // Copy pulse width to user space
+    ret = copy_to_user( buf, &pulse, 4 );
+
+    return 4;
+}
+
+ssize_t hcsr04_write(struct file *filp, const char *buffer, size_t length, loff_t * offset)
+{
+    printk( KERN_INFO "hcsr04_dev: %s\n", __func__ );
+
+    // Send 10us pulse to trigger pin
+    gpio_set_value( GPIO_OUT, 0 );
+    gpio_set_value( GPIO_OUT, 1 );
+    udelay( 10 );
+    gpio_set_value( GPIO_OUT, 0 );
+
+    // Wait for echo pin to go high and then low
+    // Rising edge
+    while( gpio_get_value( GPIO_IN ) == 0 );
+    // Record time of rising edge
+    rising = ktime_get();
+    // Falling edge
+    while( gpio_get_value( GPIO_IN ) == 1 );
+    // Record time of falling edge
+    falling = ktime_get();
+
+    return( 1 );
+}
+
+// Define file operations structure
+struct file_operations hcsr04_fops = {
+    .owner = THIS_MODULE,
+    .read = hcsr04_read,
+    .write = hcsr04_write,
+    .open = hcsr04_open,
+    .release = hcsr04_close,
+};
+
+// Module initialization function
+static int __init hcsr04_module_init(void)
+{
+    char buffer[64];
+    int ret = 0;
+
+    printk(KERN_INFO "Loading hcsr04_module\n");
+
+    // Allocate character device region
+    alloc_chrdev_region(&hcsr04_dev, 0, 1, "hcsr04_dev");
+    printk(KERN_INFO "%s\n", format_dev_t(buffer, hcsr04_dev));
+    // Initialize character device
     cdev_init(&hcsr04_cdev, &hcsr04_fops);
-    ret = cdev_add(&hcsr04_cdev, devt, 1);
-    if (ret)
-        goto err_chrdev;
+    // Set owner of the device
+    hcsr04_cdev.owner = THIS_MODULE;
+    // Add the character device to the system
+    cdev_add(&hcsr04_cdev, hcsr04_dev, 1);
 
-    /* Create class (kernel-version safe) */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,4,0)
-    hcsr04_class = class_create(CLASS_NAME);
-#else
-    hcsr04_class = class_create(THIS_MODULE, CLASS_NAME);
-#endif
-    if (IS_ERR(hcsr04_class)) {
-        ret = PTR_ERR(hcsr04_class);
-        goto err_cdev;
+    // Request GPIO_OUT
+    if( gpio_request( GPIO_OUT, "hcsr04_dev" ) )
+    {
+        printk( KERN_INFO "hcsr04_dev: %s unable to get GPIO_OUT\n", __func__ );
+        ret = -EBUSY;
+        goto Done;
+    }
+    // Request GPIO_IN
+    if( gpio_request( GPIO_IN, "hcsr04_dev" ) )
+    {
+        printk( KERN_INFO "hcsr04_dev: %s unable to get GPIO_IN\n", __func__ );
+        ret = -EBUSY;
+        goto Done;
     }
 
-    /* Auto-create /dev/hcsr04_dev */
-    hcsr04_device = device_create(
-        hcsr04_class,
-        NULL,
-        devt,
-        NULL,
-        DEVICE_NAME
-    );
-    if (IS_ERR(hcsr04_device)) {
-        ret = PTR_ERR(hcsr04_device);
-        goto err_class;
+    // Set GPIO output direction
+    if( gpio_direction_output( GPIO_OUT, 0 ) < 0 )
+    {
+        printk( KERN_INFO "hcsr04_dev: %s unable to set GPIO_OUT as output\n", __func__ );
+        ret = -EBUSY;
+        goto Done;
     }
 
-    /* GPIO setup */
-    gpiod_trig = gpio_to_desc(GPIO_TRIG + GPIO_OFFSET);
-    gpiod_echo = gpio_to_desc(GPIO_ECHO + GPIO_OFFSET);
-
-    if (!gpiod_trig || !gpiod_echo) {
-        ret = -EINVAL;
-        goto err_device;
+    // Set GPIO input direction
+    if( gpio_direction_input( GPIO_IN ) < 0 )
+    {
+        printk( KERN_INFO "hcsr04_dev: %s unable to set GPIO_IN as input\n", __func__ );
+        ret = -EBUSY;
+        goto Done;
     }
 
-    ret = gpiod_direction_output(gpiod_trig, 0);
-    if (ret)
-        goto err_device;
-
-    ret = gpiod_direction_input(gpiod_echo);
-    if (ret)
-        goto err_device;
-
-    /* IRQ */
-    echo_irq = gpiod_to_irq(gpiod_echo);
-    if (echo_irq < 0) {
-        ret = echo_irq;
-        goto err_device;
-    }
-
-    ret = request_irq(
-        echo_irq,
-        hcsr04_irq_handler,
-        IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
-        DEVICE_NAME,
-        NULL
-    );
-    if (ret)
-        goto err_device;
-
-    init_waitqueue_head(&echo_wq);
-    measurement_done = false;
-
-    pr_info("hcsr04: driver loaded successfully\n");
-    return 0;
-
-err_device:
-    device_destroy(hcsr04_class, devt);
-err_class:
-    class_destroy(hcsr04_class);
-err_cdev:
-    cdev_del(&hcsr04_cdev);
-err_chrdev:
-    unregister_chrdev_region(devt, 1);
+Done:
     return ret;
 }
 
-/* -------------------------------------------------- */
-/* Module exit                                        */
-/* -------------------------------------------------- */
-static void __exit hcsr04_exit(void)
+// Module cleanup function
+static void __exit hcsr04_module_cleanup(void)
 {
-    pr_info("hcsr04: unloading driver\n");
+    printk(KERN_INFO "Cleaning-up hcsr04_dev.\n");
 
-    free_irq(echo_irq, NULL);
-    device_destroy(hcsr04_class, devt);
-    class_destroy(hcsr04_class);
+    gpio_free( GPIO_OUT );
+    gpio_free( GPIO_IN );
+
+    hcsr04_lock = 0;
+
+    // Remove character device and unregister device region
     cdev_del(&hcsr04_cdev);
-    unregister_chrdev_region(devt, 1);
+    unregister_chrdev_region( hcsr04_dev, 1 );
 }
 
-module_init(hcsr04_init);
-module_exit(hcsr04_exit);
+// Specify module initialization and cleanup functions
+module_init(hcsr04_module_init);
+module_exit(hcsr04_module_cleanup);
 
-MODULE_LICENSE("GPL");
+// Module metadata
+MODULE_LICENSE("GPL"); 
 MODULE_AUTHOR("Atlas");
-MODULE_DESCRIPTION("HC-SR04 ultrasonic distance sensor driver");
+MODULE_DESCRIPTION("HC-SR04 Ultrasonic Sensor Driver");
+
+
+
+
+
+
+// Test code for user space application to interact with the driver
+Test:
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+int main(int argc, char **argv)
+{   
+    // Set application and character device names
+    char *app_name = argv[0];
+    char *dev_name = "/dev/hcsr04"; 
+    int fd = -1;     
+    char c;   
+    int d;
+
+    // Open character device
+    if( (fd = open(dev_name, O_RDWR)) < 0 )
+    {
+        fprintf(stderr, "%s: unable to open %s: %s\n", app_name, dev_name, strerror(errno));           
+        return( 1 ); 
+    }
+
+    c = 1;
+    // Write to device to trigger measurement
+    write( fd, &c, 1 );
+
+    // Read measurement result from device
+    read( fd, &d, 4 );
+
+    // Print distance in cm (pulse width divided by 58)
+    printf( "%d: %f\n", d, d/58.0 );
+
+    // Close character device
+    close( fd );
+
+    return 0;
+}
